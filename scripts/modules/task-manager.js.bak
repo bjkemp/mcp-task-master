@@ -9,9 +9,9 @@ import chalk from 'chalk';
 import boxen from 'boxen';
 import Table from 'cli-table3';
 import readline from 'readline';
+import { Anthropic } from '@anthropic-ai/sdk';
 import ora from 'ora';
 import inquirer from 'inquirer';
-import { createLLMService } from './llm/initLLMService.js';
 
 import {
 	CONFIG,
@@ -38,22 +38,53 @@ import {
 	createProgressBar
 } from './ui.js';
 
-import { parseTasksFromCompletion, parseSubtasksFromText } from './ai-utils.js';
+import {
+	callClaude,
+	generateSubtasks,
+	generateSubtasksWithPerplexity,
+	generateComplexityAnalysisPrompt,
+	getAvailableAIModel,
+	handleClaudeError,
+	_handleAnthropicStream,
+	getConfiguredAnthropicClient,
+	sendChatWithContext,
+	parseTasksFromCompletion,
+	generateTaskDescriptionWithPerplexity,
+	parseSubtasksFromText
+} from './ai-services.js';
 
 import {
 	validateTaskDependencies,
 	validateAndFixDependencies
 } from './dependency-manager.js';
 
-// Initialize LLM service
-const llmService = await createLLMService({
-  provider: process.env.LLM_PROVIDER || 'anthropic',
-  apiKey: process.env.LLM_API_KEY || process.env.ANTHROPIC_API_KEY,
-  model: process.env.LLM_MODEL,
-  maxTokens: process.env.LLM_MAX_TOKENS
-    ? parseInt(process.env.LLM_MAX_TOKENS)
-    : undefined
+// Initialize Anthropic client
+const anthropic = new Anthropic({
+	apiKey: process.env.ANTHROPIC_API_KEY
 });
+
+// Import perplexity if available
+let perplexity;
+
+try {
+	if (process.env.PERPLEXITY_API_KEY) {
+		// Using the existing approach from ai-services.js
+		const OpenAI = (await import('openai')).default;
+
+		perplexity = new OpenAI({
+			apiKey: process.env.PERPLEXITY_API_KEY,
+			baseURL: 'https://api.perplexity.ai'
+		});
+
+		log(
+			'info',
+			`Initialized Perplexity client with OpenAI compatibility layer`
+		);
+	}
+} catch (error) {
+	log('warn', `Failed to initialize Perplexity client: ${error.message}`);
+	log('warn', 'Research-backed features will not be available');
+}
 
 /**
  * Parse a PRD file and generate tasks
@@ -96,13 +127,16 @@ async function parsePRD(
 		// Read the PRD content
 		const prdContent = fs.readFileSync(prdPath, 'utf8');
 
-		// Generate tasks using the configured LLM service
-		const tasksData = await llmService.generateTasks(prdContent, {
-		  numTasks,
-		  reportProgress,
-		  mcpLog,
-		  session
-		});
+		// Call Claude to generate tasks, passing the provided AI client if available
+		const tasksData = await callClaude(
+			prdContent,
+			prdPath,
+			numTasks,
+			0,
+			{ reportProgress, mcpLog, session },
+			aiClient,
+			modelConfig
+		);
 
 		// Create the directory if it doesn't exist
 		const tasksDir = path.dirname(tasksPath);
@@ -362,45 +396,188 @@ The changes described in the prompt should be applied to ALL tasks in the list.`
 						);
 					}
 
-					try {
-						// Use LLM service to update tasks
-						updatedTasks = await llmService.updateTasks({
-							tasks: taskData,
-							prompt: prompt,
-							systemPrompt: systemPrompt,
-							options: {
-								reportProgress,
-								mcpLog,
-								session
-							}
+					if (modelType === 'perplexity') {
+						// Call Perplexity AI using proper format
+						const perplexityModel =
+							process.env.PERPLEXITY_MODEL ||
+							session?.env?.PERPLEXITY_MODEL ||
+							'sonar-pro';
+						const result = await client.chat.completions.create({
+							model: perplexityModel,
+							messages: [
+								{
+									role: 'system',
+									content: `${systemPrompt}\n\nAdditionally, please research the latest best practices, implementation details, and considerations when updating these tasks. Use your online search capabilities to gather relevant information. Remember to strictly follow the guidelines about preserving completed subtasks and building upon what has already been done rather than modifying or replacing it.`
+								},
+								{
+									role: 'user',
+									content: `Here are the tasks to update:
+${taskData}
+
+Please update these tasks based on the following new context:
+${prompt}
+
+IMPORTANT: In the tasks JSON above, any subtasks with "status": "done" or "status": "completed" should be preserved exactly as is. Build your changes around these completed items.
+
+Return only the updated tasks as a valid JSON array.`
+								}
+							],
+							temperature: parseFloat(
+								process.env.TEMPERATURE ||
+									session?.env?.TEMPERATURE ||
+									CONFIG.temperature
+							),
+							max_tokens: parseInt(
+								process.env.MAX_TOKENS ||
+									session?.env?.MAX_TOKENS ||
+									CONFIG.maxTokens
+							)
 						});
 
-						// Update loading indicator - only for text output
-						if (outputFormat === 'text' && loadingIndicator) {
-							stopLoadingIndicator(loadingIndicator);
-							loadingIndicator = null;
+						const responseText = result.choices[0].message.content;
+
+						// Extract JSON from response
+						const jsonStart = responseText.indexOf('[');
+						const jsonEnd = responseText.lastIndexOf(']');
+
+						if (jsonStart === -1 || jsonEnd === -1) {
+							throw new Error(
+								`Could not find valid JSON array in ${modelType}'s response`
+							);
 						}
 
+						const jsonText = responseText.substring(jsonStart, jsonEnd + 1);
+						updatedTasks = JSON.parse(jsonText);
+					} else {
+						// Call Claude to update the tasks with streaming
+						let responseText = '';
+						let streamingInterval = null;
+
+						try {
+							// Update loading indicator to show streaming progress - only for text output
+							if (outputFormat === 'text') {
+								let dotCount = 0;
+								const readline = await import('readline');
+								streamingInterval = setInterval(() => {
+									readline.cursorTo(process.stdout, 0);
+									process.stdout.write(
+										`Receiving streaming response from Claude${'.'.repeat(dotCount)}`
+									);
+									dotCount = (dotCount + 1) % 4;
+								}, 500);
+							}
+
+							// Use streaming API call
+							const stream = await client.messages.create({
+								model: session?.env?.ANTHROPIC_MODEL || CONFIG.model,
+								max_tokens: session?.env?.MAX_TOKENS || CONFIG.maxTokens,
+								temperature: session?.env?.TEMPERATURE || CONFIG.temperature,
+								system: systemPrompt,
+								messages: [
+									{
+										role: 'user',
+										content: `Here is the task to update:
+${taskData}
+
+Please update this task based on the following new context:
+${prompt}
+
+IMPORTANT: In the task JSON above, any subtasks with "status": "done" or "status": "completed" should be preserved exactly as is. Build your changes around these completed items.
+
+Return only the updated task as a valid JSON object.`
+									}
+								],
+								stream: true
+							});
+
+							// Process the stream
+							for await (const chunk of stream) {
+								if (chunk.type === 'content_block_delta' && chunk.delta.text) {
+									responseText += chunk.delta.text;
+								}
+								if (reportProgress) {
+									await reportProgress({
+										progress: (responseText.length / CONFIG.maxTokens) * 100
+									});
+								}
+								if (mcpLog) {
+									mcpLog.info(
+										`Progress: ${(responseText.length / CONFIG.maxTokens) * 100}%`
+									);
+								}
+							}
+
+							if (streamingInterval) clearInterval(streamingInterval);
+
+							report(
+								`Completed streaming response from ${modelType} API (Attempt ${modelAttempts})`,
+								'info'
+							);
+
+							// Extract JSON from response
+							const jsonStart = responseText.indexOf('[');
+							const jsonEnd = responseText.lastIndexOf(']');
+
+							if (jsonStart === -1 || jsonEnd === -1) {
+								throw new Error(
+									`Could not find valid JSON array in ${modelType}'s response`
+								);
+							}
+
+							const jsonText = responseText.substring(jsonStart, jsonEnd + 1);
+							updatedTasks = JSON.parse(jsonText);
+						} catch (streamError) {
+							if (streamingInterval) clearInterval(streamingInterval);
+
+							// Process stream errors explicitly
+							report(`Stream error: ${streamError.message}`, 'error');
+
+							// Check if this is an overload error
+							let isOverload = false;
+							// Check 1: SDK specific property
+							if (streamError.type === 'overloaded_error') {
+								isOverload = true;
+							}
+							// Check 2: Check nested error property
+							else if (streamError.error?.type === 'overloaded_error') {
+								isOverload = true;
+							}
+							// Check 3: Check status code
+							else if (
+								streamError.status === 429 ||
+								streamError.status === 529
+							) {
+								isOverload = true;
+							}
+							// Check 4: Check message string
+							else if (
+								streamError.message?.toLowerCase().includes('overloaded')
+							) {
+								isOverload = true;
+							}
+
+							if (isOverload) {
+								claudeOverloaded = true;
+								report(
+									'Claude overloaded. Will attempt fallback model if available.',
+									'warn'
+								);
+								// Let the loop continue to try the next model
+								throw new Error('Claude overloaded');
+							} else {
+								// Re-throw non-overload errors
+								throw streamError;
+							}
+						}
+					}
+
+					// If we got here successfully, break out of the loop
+					if (updatedTasks) {
 						report(
-							`Successfully updated tasks using LLM service on attempt ${modelAttempts}`,
+							`Successfully updated tasks using ${modelType} on attempt ${modelAttempts}`,
 							'success'
 						);
 						break;
-					} catch (error) {
-						report(`LLM service error: ${error.message}`, 'error');
-
-						// Check for overload condition
-						const isOverload = error.type === 'overloaded_error' ||
-							error.error?.type === 'overloaded_error' ||
-							error.status === 429 ||
-							error.status === 529 ||
-							error.message?.toLowerCase().includes('overloaded');
-
-						if (isOverload && !isLastAttempt) {
-							report('Model overloaded, trying next attempt', 'warn');
-							continue;
-						}
-						throw error;
 					}
 				} catch (modelError) {
 					const failedModel = modelType || 'unknown model';
